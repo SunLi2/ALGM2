@@ -26,7 +26,7 @@ The codes are tested in the following environment:
 
 - **The foreground prediction model framework**
 
-- 
+
 ![Exp](https://github.com/SunLi2/ALGM2/blob/master/assets/pic1.png)
 
 ---

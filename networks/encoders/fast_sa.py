@@ -1,0 +1,583 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+import torch
+import torch.nn as nn
+from torch.nn import Parameter
+from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+from functools import partial
+from typing import List
+from torch import Tensor
+import copy
+import os
+# from ops import SpectralNorm
+import torch.nn.functional as F
+try:
+    from mmdet.models.builder import BACKBONES as det_BACKBONES
+    from mmdet.utils import get_root_logger
+    from mmcv.runner import _load_checkpoint
+    has_mmdet = True
+except ImportError:
+    # print("If for detection, please install mmdetection first")
+    has_mmdet = False
+
+
+def l2normalize(v, eps=1e-12):
+    return v / (v.norm() + eps)
+
+class SpectralNorm(nn.Module):
+    """
+    Based on https://github.com/heykeetae/Self-Attention-GAN/blob/master/spectral.py
+    and add _noupdate_u_v() for evaluation
+    """
+    def __init__(self, module, name='weight', power_iterations=1):
+        super(SpectralNorm, self).__init__()
+        self.module = module
+        self.name = name
+        self.power_iterations = power_iterations
+        if not self._made_params():
+            self._make_params()
+
+    def _update_u_v(self):
+        u = getattr(self.module, self.name + "_u")   #getattr用来获取对象中的属性值
+        v = getattr(self.module, self.name + "_v")
+        w = getattr(self.module, self.name + "_bar")
+
+        height = w.data.shape[0]
+        for _ in range(self.power_iterations):
+            v.data = l2normalize(torch.mv(torch.t(w.view(height,-1).data), u.data))
+            u.data = l2normalize(torch.mv(w.view(height,-1).data, v.data))
+
+        sigma = u.dot(w.view(height, -1).mv(v))
+        setattr(self.module, self.name, w / sigma.expand_as(w))  #getattr用来设置对象中的属性值
+
+    def _noupdate_u_v(self):
+        u = getattr(self.module, self.name + "_u")
+        v = getattr(self.module, self.name + "_v")
+        w = getattr(self.module, self.name + "_bar")
+
+        height = w.data.shape[0]
+        sigma = u.dot(w.view(height, -1).mv(v))
+        setattr(self.module, self.name, w / sigma.expand_as(w))
+
+    def _made_params(self):
+        try:
+            u = getattr(self.module, self.name + "_u")
+            v = getattr(self.module, self.name + "_v")
+            w = getattr(self.module, self.name + "_bar")
+            return True
+        except AttributeError:
+            return False
+
+    def _make_params(self):
+        w = getattr(self.module, self.name)
+
+        height = w.data.shape[0]
+        width = w.view(height, -1).data.shape[1]
+
+        u = Parameter(w.data.new(height).normal_(0, 1), requires_grad=False)
+        v = Parameter(w.data.new(width).normal_(0, 1), requires_grad=False)
+        u.data = l2normalize(u.data)
+        v.data = l2normalize(v.data)
+        w_bar = Parameter(w.data)
+
+        # device = torch.device("cuda:0")  # 替换为您要使用的GPU设备
+        # w = w.to(device)
+        # w_bar = w_bar.to(device)
+        del self.module._parameters[self.name]
+
+        self.module.register_parameter(self.name + "_u", u)
+        self.module.register_parameter(self.name + "_v", v)
+        self.module.register_parameter(self.name + "_bar", w_bar)
+
+    def forward(self, *args):
+        # if torch.is_grad_enabled() and self.module.training:
+        if self.module.training:
+            self._update_u_v()
+        else:
+            self._noupdate_u_v()
+        return self.module.forward(*args)
+
+
+class Partial_conv3(nn.Module):
+
+    def __init__(self, dim, n_div, forward):
+        super().__init__()
+        self.dim_conv3 = dim // n_div
+        self.dim_untouched = dim - self.dim_conv3
+        self.partial_conv3 = nn.Conv2d(self.dim_conv3, self.dim_conv3, 3, 1, 1, bias=False)
+
+        if forward == 'slicing':
+            self.forward = self.forward_slicing
+        elif forward == 'split_cat':
+            self.forward = self.forward_split_cat
+        else:
+            raise NotImplementedError
+
+    def forward_slicing(self, x: Tensor) -> Tensor:
+        # only for inference
+        x = x.clone()   # !!! Keep the original input intact for the residual connection later
+        x[:, :self.dim_conv3, :, :] = self.partial_conv3(x[:, :self.dim_conv3, :, :])
+
+        return x
+
+    def forward_split_cat(self, x: Tensor) -> Tensor:
+        # for training/inference
+        x1, x2 = torch.split(x, [self.dim_conv3, self.dim_untouched], dim=1)
+        x1 = self.partial_conv3(x1)
+        x = torch.cat((x1, x2), 1)
+
+        return x
+
+class sa_layer(nn.Module):
+    """Constructs a Channel Spatial Group module.
+
+    Args:
+        k_size: Adaptive selection of kernel size
+    """
+
+    def __init__(self, channel, groups=32):
+        super(sa_layer, self).__init__()
+        self.groups = groups
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.cweight = Parameter(torch.zeros(1, channel // (2 * groups), 1, 1))
+        self.cbias = Parameter(torch.ones(1, channel // (2 * groups), 1, 1))
+        self.sweight = Parameter(torch.zeros(1, channel // (2 * groups), 1, 1))
+        self.sbias = Parameter(torch.ones(1, channel // (2 * groups), 1, 1))
+
+        self.sigmoid = nn.Sigmoid()
+        self.gn = nn.GroupNorm(channel // (2 * groups), channel // (2 * groups))
+
+    @staticmethod
+    def channel_shuffle(x, groups):
+        b, c, h, w = x.shape
+
+        x = x.reshape(b, groups, -1, h, w)
+        x = x.permute(0, 2, 1, 3, 4)
+
+        # flatten
+        x = x.reshape(b, -1, h, w)
+
+        return x
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+
+        x = x.reshape(b * self.groups, -1, h, w)
+        x_0, x_1 = x.chunk(2, dim=1)
+
+        # channel attention
+        xn = self.avg_pool(x_0)
+        xn = self.cweight * xn + self.cbias
+        xn = x_0 * self.sigmoid(xn)
+
+        # spatial attention
+        xs = self.gn(x_1)
+        xs = self.sweight * xs + self.sbias
+        xs = x_1 * self.sigmoid(xs)
+
+        # concatenate along channel axis
+        out = torch.cat([xn, xs], dim=1)
+        out = out.reshape(b, -1, h, w)
+
+        out = self.channel_shuffle(out, 2)
+        return out
+
+
+class MLPBlock(nn.Module):
+
+    def __init__(self,
+                 dim,
+                 n_div,
+                 mlp_ratio,
+                 drop_path,
+                 layer_scale_init_value,
+                 act_layer,
+                 norm_layer,
+                 pconv_fw_type
+                 ):
+
+        super().__init__()
+        self.dim = dim
+        self.mlp_ratio = mlp_ratio
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.n_div = n_div
+
+        mlp_hidden_dim = int(dim * mlp_ratio)
+
+        mlp_layer = [
+            nn.Conv2d(dim, mlp_hidden_dim, 1, bias=False),
+            norm_layer(mlp_hidden_dim),
+            act_layer(),
+            nn.Conv2d(mlp_hidden_dim, dim, 1, bias=False)
+        ]
+
+        self.mlp = nn.Sequential(*mlp_layer)
+
+        self.spatial_mixing = Partial_conv3(
+            dim,
+            n_div,
+            pconv_fw_type
+        )
+
+        self.sa=sa_layer(dim)
+
+        if layer_scale_init_value > 0:
+            self.layer_scale = nn.Parameter(layer_scale_init_value * torch.ones((dim)), requires_grad=True)
+            self.forward = self.forward_layer_scale
+        else:
+            self.forward = self.forward
+
+    def forward(self, x: Tensor) -> Tensor:
+        shortcut = x
+        x = self.spatial_mixing(x)
+
+        x=self.sa(x)
+        x = shortcut + self.drop_path(self.mlp(x))
+        return x
+
+    def forward_layer_scale(self, x: Tensor) -> Tensor:
+        shortcut = x
+        x = self.spatial_mixing(x)
+
+        x = shortcut + self.drop_path(
+            self.layer_scale.unsqueeze(-1).unsqueeze(-1) * self.mlp(x))
+        return x
+
+
+class BasicStage(nn.Module):
+
+    def __init__(self,
+                 dim,
+                 depth,
+                 n_div,
+                 mlp_ratio,
+                 drop_path,
+                 layer_scale_init_value,
+                 norm_layer,
+                 act_layer,
+                 pconv_fw_type
+                 ):
+
+        super().__init__()
+
+        blocks_list = [
+            MLPBlock(
+                dim=dim,
+                n_div=n_div,
+                mlp_ratio=mlp_ratio,
+                drop_path=drop_path[i],
+                layer_scale_init_value=layer_scale_init_value,
+                norm_layer=norm_layer,
+                act_layer=act_layer,
+                pconv_fw_type=pconv_fw_type
+            )
+            for i in range(depth)
+        ]
+
+        self.blocks = nn.Sequential(*blocks_list)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.blocks(x)
+        return x
+
+
+class PatchEmbed(nn.Module):
+
+    def __init__(self, patch_size, patch_stride, in_chans, embed_dim, norm_layer):
+        super().__init__()
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_stride, bias=False)
+        if norm_layer is not None:
+            self.norm = norm_layer(embed_dim)
+        else:
+            self.norm = nn.Identity()
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.norm(self.proj(x))
+        return x
+
+
+class PatchMerging(nn.Module):
+
+    def __init__(self, patch_size2, patch_stride2, dim, norm_layer):
+        super().__init__()
+        self.reduction = nn.Conv2d(dim, 2 * dim, kernel_size=patch_size2, stride=patch_stride2, bias=False)
+        if norm_layer is not None:
+            self.norm = norm_layer(2 * dim)
+        else:
+            self.norm = nn.Identity()
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.norm(self.reduction(x))
+        return x
+
+
+class FasterNet(nn.Module):
+
+    def __init__(self,
+                 in_chans=6,
+                 num_classes=1000,
+                 embed_dim=64,
+                 depths=(1, 2, 8, 2),
+                 mlp_ratio=2.,
+                 n_div=4,
+                 patch_size=4,
+                 patch_stride=4,
+                 patch_size2=2,  # for subsequent layers
+                 patch_stride2=2,
+                 patch_norm=True,
+                 feature_dim=1280,
+                 drop_path_rate=0.1,
+                 layer_scale_init_value=0,
+                 norm_layer='BN',
+                 act_layer='RELU',
+                 fork_feat=True,
+                 init_cfg=None,
+                 pretrained=None,
+                 pconv_fw_type='split_cat',
+                 **kwargs):
+        super().__init__()
+
+        if norm_layer == 'BN':
+            norm_layer = nn.BatchNorm2d
+        else:
+            raise NotImplementedError
+
+        if act_layer == 'GELU':
+            act_layer = nn.GELU
+        elif act_layer == 'RELU':
+            act_layer = partial(nn.ReLU, inplace=True)
+        else:
+            raise NotImplementedError
+
+        if not fork_feat:
+            self.num_classes = num_classes
+        self.num_stages = len(depths)
+        self.embed_dim = embed_dim
+        self.patch_norm = patch_norm
+        self.num_features = int(embed_dim * 2 ** (self.num_stages - 1))
+        self.mlp_ratio = mlp_ratio
+        self.depths = depths
+
+        # split image into non-overlapping patches
+        self.patch_embed = PatchEmbed(
+            patch_size=patch_size,
+            patch_stride=patch_stride,
+            in_chans=in_chans,
+            embed_dim=embed_dim,
+            norm_layer=norm_layer if self.patch_norm else None
+        )
+
+        # stochastic depth decay rule
+        dpr = [x.item()
+               for x in torch.linspace(0, drop_path_rate, sum(depths))]
+
+        # build layers
+        stages_list = []
+        for i_stage in range(self.num_stages):
+            stage = BasicStage(dim=int(embed_dim * 2 ** i_stage),
+                               n_div=n_div,
+                               depth=depths[i_stage],
+                               mlp_ratio=self.mlp_ratio,
+                               drop_path=dpr[sum(depths[:i_stage]):sum(depths[:i_stage + 1])],
+                               layer_scale_init_value=layer_scale_init_value,
+                               norm_layer=norm_layer,
+                               act_layer=act_layer,
+                               pconv_fw_type=pconv_fw_type
+                               )
+            stages_list.append(stage)
+
+            # patch merging layer
+            if i_stage < self.num_stages - 1:
+                stages_list.append(
+                    PatchMerging(patch_size2=patch_size2,
+                                 patch_stride2=patch_stride2,
+                                 dim=int(embed_dim * 2 ** i_stage),
+                                 norm_layer=norm_layer)
+                )
+
+        self.stages = nn.Sequential(*stages_list)
+
+        self.fork_feat = fork_feat
+
+        if self.fork_feat:
+            self.forward = self.forward_det
+            # add a norm layer for each output
+            self.out_indices = [0, 2, 4, 6]
+            for i_emb, i_layer in enumerate(self.out_indices):
+                if i_emb == 0 and os.environ.get('FORK_LAST3', None):
+                    raise NotImplementedError
+                else:
+                    layer = norm_layer(int(embed_dim * 2 ** i_emb))
+                layer_name = f'norm{i_layer}'
+                self.add_module(layer_name, layer)
+        else:
+            self.forward = self.forward_cls
+            # Classifier head
+            self.avgpool_pre_head = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(self.num_features, feature_dim, 1, bias=False),
+                act_layer()
+            )
+            self.head = nn.Linear(feature_dim, num_classes) \
+                if num_classes > 0 else nn.Identity()
+
+        self.apply(self.cls_init_weights)
+        self.init_cfg = copy.deepcopy(init_cfg)
+        if self.fork_feat and (self.init_cfg is not None or pretrained is not None):
+            self.init_weights()
+
+
+        # num_features = [int(embed_dim * 2 ** i) for i in range(4)]
+        # self.num_features = num_features
+        # # add a norm layer for each output [from Swin-Transformer-Semantic-Segmentation]
+        # # 为每个输出[从Swin-Transformer-Semantic-Segmentation]添加一个范数层
+        # for i_layer in (0,1,2,3):  # out_indices=(0, 1, 2, 3)
+        #     layer = norm_layer(num_features[i_layer])
+        #     layer_name = f'norm{i_layer}'
+        #     self.add_module(layer_name, layer)
+
+        # add shortcut layer [from MG-Matting]添加连接层
+        self.shortcut = nn.ModuleList()
+        # shortcut_inplanes = [[6, 32], [96, 32], [96, 64], [192, 128], [384, 256], [768, 512]]
+        shortcut_inplanes = [[6, 32], [64, 32], [64, 64], [128, 128], [256, 256], [512, 512]]
+        for shortcut in shortcut_inplanes:
+            inplane, planes = shortcut
+            self.shortcut.append(self._make_shortcut(inplane=inplane, planes=planes, norm_layer=nn.BatchNorm2d))
+
+    def _make_shortcut(self, inplane, planes, norm_layer=nn.BatchNorm2d):
+        '''
+        came from MGMatting  来自MGMatting
+        '''
+        return nn.Sequential(
+            SpectralNorm(nn.Conv2d(inplane, planes, kernel_size=3, padding=1, bias=False)),
+            nn.ReLU(inplace=True),
+            norm_layer(planes),
+            SpectralNorm(nn.Conv2d(planes, planes, kernel_size=3, padding=1, bias=False)),
+            nn.ReLU(inplace=True),
+            norm_layer(planes)
+        )
+
+
+    def cls_init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, (nn.Conv1d, nn.Conv2d)):
+            trunc_normal_(m.weight, std=.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, (nn.LayerNorm, nn.GroupNorm)):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    # init for mmdetection by loading imagenet pre-trained weights
+    def init_weights(self, pretrained=None):
+        logger = get_root_logger()
+        if self.init_cfg is None and pretrained is None:
+            logger.warn(f'No pre-trained weights for '
+                        f'{self.__class__.__name__}, '
+                        f'training start from scratch')
+            pass
+        else:
+            assert 'checkpoint' in self.init_cfg, f'Only support ' \
+                                                  f'specify `Pretrained` in ' \
+                                                  f'`init_cfg` in ' \
+                                                  f'{self.__class__.__name__} '
+            if self.init_cfg is not None:
+                ckpt_path = self.init_cfg['checkpoint']
+            elif pretrained is not None:
+                ckpt_path = pretrained
+
+            ckpt = _load_checkpoint(
+                ckpt_path, logger=logger, map_location='cpu')
+            if 'state_dict' in ckpt:
+                _state_dict = ckpt['state_dict']
+            elif 'model' in ckpt:
+                _state_dict = ckpt['model']
+            else:
+                _state_dict = ckpt
+
+            state_dict = _state_dict
+            missing_keys, unexpected_keys = \
+                self.load_state_dict(state_dict, False)
+
+            # show for debug
+            print('missing_keys: ', missing_keys)
+            print('unexpected_keys: ', unexpected_keys)
+
+    def forward_cls(self, x):
+        # output only the features of last layer for image classification
+        x = self.patch_embed(x)  #1,3,512,512->1,96,128,128
+        x = self.stages(x)
+        x = self.avgpool_pre_head(x)  # B C 1 1
+        x = torch.flatten(x, 1)
+        x = self.head(x)
+
+        return x
+
+    def forward_det(self, x: Tensor) -> Tensor:
+        # output the features of four stages for dense prediction
+        outs = []
+        outs.append(x)
+        x = self.patch_embed(x)
+        outs.append(F.upsample_bilinear(x, scale_factor=2.0))
+        for idx, stage in enumerate(self.stages):
+            x = stage(x)
+            # outs.append(x)
+            if self.fork_feat and idx in self.out_indices:
+                norm_layer = getattr(self, f'norm{idx}')
+                x_out = norm_layer(x)
+                outs.append(x_out)
+        for i in range(6):
+            outs[i] = self.shortcut[i](outs[i])
+        return outs
+
+def AddWeight(model):
+    # pretrained_weights = "/home/sll/data/sll/MattingCode/FasterNet/pretrained/fasternet_t2-epoch.289-val_acc1.78.8860.pth"
+    pretrained_weights = "/home/ljh/SLL/data/sll/MattingCode/AAAA/matteformer_fg_alpha/pretrain/fasternet_t1-epoch.291-val_acc1.76.2180.pth"
+    pretrained_state_dict = torch.load(pretrained_weights)
+    pretrained_patch_embed_weight = pretrained_state_dict['patch_embed.proj.weight']
+    current_state_dict = model.state_dict()
+    # 获取当前模型中的 patch_embed.proj.weight
+    current_patch_embed_weight = current_state_dict['patch_embed.proj.weight']
+
+    # 检查预训练权重和当前权重的形状
+    if pretrained_patch_embed_weight.shape != current_patch_embed_weight.shape:
+        # 形状不匹配，你可以根据需要调整形状
+        # 这里示范了如何填充0来匹配当前模型的形状
+        padded_weight = torch.zeros(current_patch_embed_weight.shape)
+        padded_weight[:, :pretrained_patch_embed_weight.shape[1], :, :] = pretrained_patch_embed_weight
+        pretrained_state_dict['patch_embed.proj.weight'] = padded_weight
+    else:
+        # 形状匹配，直接加载权重
+        current_state_dict['patch_embed.proj.weight'] = pretrained_patch_embed_weight
+
+    # for key, value in pretrained_patch_embed_weight.items():
+    #     if "avgpool_pre_head" not in key and "head" not in key:
+    #         model.load_state_dict({key: value}, strict=False)
+    model.load_state_dict(pretrained_state_dict, strict=False)
+    print("loaded weights")
+
+
+def FastNet(istrain):
+    model=FasterNet()
+    if istrain:
+        AddWeight(model)
+    print("加载权重")
+    return model
+
+
+# FastNet(True)
+#
+# x=torch.randn(1,6,473,373).cuda()
+# import time
+#
+# m=FasterNet().cuda()
+# total_params = sum(p.numel() for p in m.parameters())
+# print(f"Total parameters: {total_params}")
+# start=time.time()
+# out=m(x)
+# end=time.time()
+# print(end-start)
+# print(x.shape)

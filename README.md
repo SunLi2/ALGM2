@@ -1,13 +1,13 @@
-# MatteFormer
+# ALGM
 
 ---
 
-This repository includes the official project of MatteFormer, presented in our paper:
-[MatteFormer: Transformer-Based Image Matting via Prior-Tokens](https://arxiv.org/abs/2203.15662) [CVPR 22]
 
-![Exp](assets/exp2.png)
 
-In this paper, we propose a transformer-based image matting model called MatteFormer, which takes full advantage of trimap information in the transformer block. Our method first introduces a prior-token which is a global representation of each trimap region (e.g. foreground, background and unknown). These prior-tokens are used as global priors and participate in the self-attention mechanism of each block. Each stage of the encoder is composed of PAST (Prior-Attentive Swin Transformer) block, which is based on the Swin Transformer block, but differs in a couple of aspects: 1) It has PA-WSA (Prior-Attentive Window Self-Attention) layer, performing self-attention not only with spatial-tokens but also with prior-tokens. 2) It has prior-memory which saves prior-tokens accumulatively from the previous blocks and transfers them to the next block. We evaluate our MatteFormer on the commonly used image matting datasets: Composition-1k and Distinctions-646. Experiment results show that our proposed method achieves state-of-the-art performance with a large margin.
+![Exp](https://github.com/SunLi2/ALGM2/blob/master/assets/compare1.png)
+![Exp](https://github.com/SunLi2/ALGM2/blob/master/assets/compare2.png)
+![Exp](https://github.com/SunLi2/ALGM2/blob/master/assets/compare3.png)
+This paper focuses on the image composition of transparent objects, where existing image matting methods suffer from composition errors due to the lack of accurate foreground during the composition process. We propose a foreground prediction model named ALGM, which leverages the local feature extraction capabilities of Convolutional Neural Networks (CNNs) and incorporates an attention mechanism for global information modeling. The proposed alpha-assisted foreground prediction module extracts foreground information from the original image and conveys it. The extracted foreground color information is combined with the deep structural features of the encoder and used for foreground color prediction. ALGM reduces image composition errors in the quantitative data from the Composition-1k dataset and improves the visual quality of composed images on the AIM-500 and Transparent-460 datasets.
 
 ---
 
@@ -18,9 +18,10 @@ The codes are tested in the following environment:
 - CUDA 10.2 & CuDNN 8
 
 ### Performances
-| Models | SAD | MSE (x10^(-3) | Grad | Conn | Link | 
-|:---:|:---:|:---:|:---:|:---:|:---:|
-MatteFormer | 23.80 | 4.03 | 8.68 | 18.90 | [model](https://drive.google.com/file/d/1AU7uM1dtYjEhtOa_9OGfoQUE-tmW9mX5/view?usp=sharing) |
+
+![Exp](https://github.com/SunLi2/ALGM2/blob/master/assets/Table1.png)
+
+![Exp](https://github.com/SunLi2/ALGM2/blob/master/assets/pic1.png)
 
 ---
 
@@ -60,21 +61,10 @@ python3 evaluate.py
 
 3] run main.py
 ```
-CUDA_VISIBLE_DEVICES=0,1 python3 -m torch.distributed.launch --nproc_per_node=2 main.py
+CUDA_VISIBLE_DEVICES=1 python3 -m torch.distributed.launch --nproc_per_node=2 main.py
 ```
 
 ---
-
-### Citation
-If you find this work or code useful for your research, please use the following BibTex entry:
-```
-@article{park2022matteformer,
-  title={MatteFormer: Transformer-Based Image Matting via Prior-Tokens},
-  author={Park, GyuTae and Son, SungJoon and Yoo, JaeYoung and Kim, SeHo and Kwak, Nojun},
-  journal={arXiv preprint arXiv:2203.15662},
-  year={2022}
-}
-```
 
 
 ### Acknowledgment
@@ -82,28 +72,3 @@ If you find this work or code useful for your research, please use the following
 - Also, we build our codes with reference as [GCA-Matting](https://github.com/Yaoyi-Li/GCA-Matting) and [Swin Transformer for Semantic Segmentation](https://github.com/SwinTransformer/Swin-Transformer-Semantic-Segmentation)
 
 
-### License
-MatteFormer is licensed under Apache-2.0, except utils/logger.py which is adopted from https://github.com/JiahuiYu/generative_inpainting under CC BY-NC 4.0.
-See [LICENSE](/LICENSE) for the full license text.
-
-```
-MatteFormer
-
-Copyright 2022-present NAVER WEBTOON
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
-```
-
-
-![webtoonai](assets/webtoonai.png)

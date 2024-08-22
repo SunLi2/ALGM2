@@ -14,10 +14,10 @@ The codes are tested in the following environment:
 
 ### Performances
 
-- **Qualitative comparison of different methods for compositing on the dataset Composition-1k.  ,  , I same as above. X(Y) represents the image composition result of method X predicting alpha matte and Y.**
+- **Quantitative evaluation of image composition loss for our method and other methods on the Composition-1k dataset**
 ![Exp](https://github.com/SunLi2/ALGM2/blob/master/assets/Table1.png)
 
-
+- **Qualitative comparison of different methods for compositing on the dataset Composition-1k.**
 ![Exp](https://github.com/SunLi2/ALGM2/blob/master/assets/compare1.png)
 ![Exp](https://github.com/SunLi2/ALGM2/blob/master/assets/compare2.png)
 ![Exp](https://github.com/SunLi2/ALGM2/blob/master/assets/compare3.png)

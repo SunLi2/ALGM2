@@ -2,12 +2,12 @@
 
 ---
 
+- This paper focuses on the image composition of transparent objects, where existing image matting methods suffer from composition errors due to the lack of accurate foreground during the composition process. We propose a foreground prediction model named ALGM, which leverages the local feature extraction capabilities of Convolutional Neural Networks (CNNs) and incorporates an attention mechanism for global information modeling. The proposed alpha-assisted foreground prediction module extracts foreground information from the original image and conveys it. The extracted foreground color information is combined with the deep structural features of the encoder and used for foreground color prediction. ALGM reduces image composition errors in the quantitative data from the Composition-1k dataset and improves the visual quality of composed images on the AIM-500 and Transparent-460 datasets.
 
 
 ![Exp](https://github.com/SunLi2/ALGM2/blob/master/assets/compare1.png)
 ![Exp](https://github.com/SunLi2/ALGM2/blob/master/assets/compare2.png)
 ![Exp](https://github.com/SunLi2/ALGM2/blob/master/assets/compare3.png)
-This paper focuses on the image composition of transparent objects, where existing image matting methods suffer from composition errors due to the lack of accurate foreground during the composition process. We propose a foreground prediction model named ALGM, which leverages the local feature extraction capabilities of Convolutional Neural Networks (CNNs) and incorporates an attention mechanism for global information modeling. The proposed alpha-assisted foreground prediction module extracts foreground information from the original image and conveys it. The extracted foreground color information is combined with the deep structural features of the encoder and used for foreground color prediction. ALGM reduces image composition errors in the quantitative data from the Composition-1k dataset and improves the visual quality of composed images on the AIM-500 and Transparent-460 datasets.
 
 ---
 
